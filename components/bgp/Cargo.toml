@@ -1,0 +1,9 @@
+[package]
+name = "comp-bgp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+ipnet = "2.9"
+nos-common = { path = "../../nos-common" }

@@ -1,0 +1,10 @@
+[package]
+name = "comp-rib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+ipnet = "2.9"
+nos-common = { path = "../../nos-common" }

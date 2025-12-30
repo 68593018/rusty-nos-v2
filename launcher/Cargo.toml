@@ -1,0 +1,11 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+nos-common = { path = "../nos-common" }
+comp-bgp = { path = "../components/bgp" }
+comp-rib = { path = "../components/rib" }
