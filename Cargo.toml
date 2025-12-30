@@ -4,5 +4,6 @@ members = [
     "nos-common",
     "components/bgp",
     "components/rib",
+    "components/ifmgr",
     "launcher",
 ]

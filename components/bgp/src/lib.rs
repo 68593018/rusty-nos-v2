@@ -1,45 +1,98 @@
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use ipnet::IpNet;
-// 1. 只引用接口，不引用具体实现
-use nos_common::services::RibService; 
-// 2. 引用数据定义
-use nos_common::data::rib::{RouteEntry, RouteProtocol};
 
-// BGP 主任务
-// 参数 rib: Box<dyn RibService> 表示“任何实现了 RibService 接口的对象”
-pub async fn run(rib: Box<dyn RibService>) {
-    println!("🌍 BGP 组件启动 (等待邻居建立)...");
+// 引用公共定义
+use nos_common::services::{RibService, InterfaceService};
+use nos_common::data::rib::{RouteEntry, RouteProtocol};
+use nos_common::data::interface::{InterfaceEvent, OperState};
+
+// 1. 定义上下文：打包 BGP 运行所需的所有服务
+// 使用 Arc 是为了方便 Clone 后在多个 Task 中共享
+pub struct BgpContext {
+    pub rib: Arc<dyn RibService>,
+    pub ifmgr: Arc<dyn InterfaceService>,
+}
+
+pub async fn run(ctx: BgpContext) {
+    println!("🌍 BGP 组件启动...");
+
+    // =====================================================
+    // 核心逻辑：快照 (Snapshot) + 增量 (Delta)
+    // =====================================================
+
+    // 1. 【订阅】先拿到接收端 (防止漏掉快照过程中的事件)
+    // 必须在查全量之前订阅，否则会产生“时间黑洞”
+    let mut if_rx = ctx.ifmgr.subscribe();
+
+    // 2. 【快照】获取当前所有 Up 的接口
+    // BGP 刚启动时，接口可能已经 Up 很久了，不会有广播事件，必须主动查
+    let current_interfaces = ctx.ifmgr.get_all_interfaces().await;
+    for iface in current_interfaces {
+        if iface.state == OperState::Up {
+            println!("🔍 [Snapshot] BGP 发现已有接口 Up: {} -> 尝试建立邻居", iface.name);
+            // TODO: 这里调用 neighbor_fsm.start(iface)
+        }
+    }
+
+    // 3. 【增量】启动后台任务监听后续变化
+    // 使用 move 关键字将 rx 的所有权转移给新线程
+    tokio::spawn(async move {
+        println!("👂 BGP 事件监听线程已就绪...");
+        loop {
+            // recv() 会挂起等待，不消耗 CPU
+            match if_rx.recv().await {
+                Ok(event) => {
+                    match event {
+                        InterfaceEvent::LinkUp(entry) => {
+                            println!("🔔 [Delta] BGP 收到通知: 接口 {} Up! -> 建立邻居", entry.name);
+                        }
+                        InterfaceEvent::LinkDown(name) => {
+                            println!("🔔 [Delta] BGP 收到通知: 接口 {} Down! -> 断开邻居", name);
+                        }
+                        InterfaceEvent::MtuChanged(name, new_mtu) => {
+                            println!("ℹ️ [Delta] 接口 {} MTU 变更为 {}", name, new_mtu);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(count)) => {
+                    println!("⚠️ BGP 处理太慢，丢失了 {} 条广播消息 (Lagged)", count);
+                    // 生产环境中，这里通常需要重新执行一次“快照”流程
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    println!("🛑 广播通道已关闭");
+                    break;
+                }
+            }
+        }
+    });
+
+    // =====================================================
+    // BGP 主逻辑 (模拟路由生成)
+    // =====================================================
+    println!("🚀 BGP 主路由循环启动 (Wait for neighbors)...");
     
-    // 模拟 BGP 建立邻居耗时
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    println!("🤝 BGP Neighbor 192.168.1.2 Established!");
+    // 模拟等待邻居建立
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut counter = 0;
-
-    // 模拟持续接收路由
     loop {
         counter += 1;
         
-        // 构造一个动态的路由前缀 (10.0.X.0/24)
-        let prefix_str = format!("10.0.{}.0/24", counter % 255);
-        let prefix: IpNet = prefix_str.parse().unwrap();
-
-        // 构造数据对象 (使用 struct update syntax 简化代码)
+        let prefix: IpNet = format!("10.0.{}.0/24", counter % 255).parse().unwrap();
         let entry = RouteEntry {
             protocol: RouteProtocol::BGP,
             prefix,
             nexthop: "192.168.1.1".parse().unwrap(),
             metric: 100,
-            ..Default::default() // 其他字段用默认值
+            ..Default::default()
         };
 
-        println!("⚡ [Tick {}] BGP 收到路由更新: {} -> 调用接口", counter, prefix);
-        
-        // 3. 核心调用：通过接口发送数据
-        // BGP 根本不知道这行代码背后会触发锁、通知和后台计算
-        rib.update_route(entry).await;
+        println!("⚡ [Tick {}] BGP 注入路由: {}", counter, prefix);
+        ctx.rib.update_route(entry).await;
 
-        // 每 3 秒产生一条
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

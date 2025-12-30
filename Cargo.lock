@@ -47,6 +47,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "comp-ifmgr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "nos-common",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "comp-rib"
 version = "0.1.0"
 dependencies = [
@@ -78,6 +89,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "comp-bgp",
+ "comp-ifmgr",
  "comp-rib",
  "nos-common",
  "tokio",
