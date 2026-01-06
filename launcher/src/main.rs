@@ -1,8 +1,21 @@
 use std::sync::Arc;
 use tokio::signal;
+//use console_subscriber::ConsoleLayer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+
+    // ==========================================================
+    // 0. 【核心步骤】初始化 Console
+    // ==========================================================
+    // 这行代码会启动一个后台 Server，默认监听 127.0.0.1:6669
+    // 它会拦截所有的 tokio::spawn 创建的任务信息
+    //console_subscriber::init();
+
+
+    //println!("✨ 系统运行中... (正在等待连接)");
+
+
     println!("==============================================");
     println!("🚀 RustyNOS v2.1 全系统启动 (Pub/Sub + Context)");
     println!("==============================================");
