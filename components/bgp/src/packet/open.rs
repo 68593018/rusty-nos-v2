@@ -44,4 +44,44 @@ impl OpenMessage {
     }
     
     // decode 暂时不写，我们先跑起来发送逻辑
+    /// 从字节流中解析 OPEN 消息
+    pub fn decode(buf: &mut Cursor<&[u8]>) -> io::Result<Self> {
+        // OPEN 消息最小长度检查 (1 byte Ver + 2 AS + 2 Hold + 4 ID + 1 OptLen = 10 bytes)
+        if buf.remaining() < 10 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Open message too short"));
+        }
+
+        // 1. Version (必须是 4)
+        let version = buf.get_u8();
+        if version != 4 {
+             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Unsupported BGP version: {}", version)));
+        }
+
+        // 2. My AS
+        let my_as = buf.get_u16();
+
+        // 3. Hold Time
+        let hold_time = buf.get_u16();
+
+        // 4. BGP Identifier (Router ID)
+        let bgp_id_u32 = buf.get_u32();
+        let bgp_id = Ipv4Addr::from(bgp_id_u32);
+
+        // 5. Optional Parameters Length
+        let opt_param_len = buf.get_u8();
+
+        // 6. 跳过可选参数 (Capabilities) - 后面 Phase 3.x 再详细解析
+        if buf.remaining() < opt_param_len as usize {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Optional parameters truncated"));
+        }
+        buf.advance(opt_param_len as usize);
+
+        Ok(Self {
+            version,
+            my_as,
+            hold_time,
+            bgp_id,
+        })
+    }
 }
+

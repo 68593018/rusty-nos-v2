@@ -3,6 +3,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::io::{AsyncReadExt, AsyncWriteExt}; // <--- 必须加这个！
+use std::io::Cursor;
+use bytes::BytesMut;
+use crate::packet::{BgpHeader, BgpMessageType, OpenMessage};
+
 use ipnet::IpNet;
 
 // 引入公共定义
@@ -88,14 +93,24 @@ impl BgpServer {
                 // 如果当前没有连接，就接受这个连接
                 match peer.state {
                     SessionState::Idle | SessionState::Connect | SessionState::Active => {
-                        println!("🤝 [BgpServer] 接受连接，状态迁移 -> Active (模拟)");
+                        println!("🤝 [BgpServer] 接受连接，准备握手...");
                         
-                        // 将 TCP 流保存到 Peer 结构中
-                        peer.stream = Some(stream);
-                        // 更新状态 (这里暂时简略，真正 FSM 会更复杂)
+                        // 更新状态
                         peer.state = SessionState::Active; 
                         
-                        // TODO: 在 Phase 3 这里会启动一个 tokio::spawn 来处理报文读写
+                        // === 关键修改：启动握手任务 ===
+                        // 我们把 stream 的所有权拿走，交给一个新的异步任务去跑
+                        // 这样主线程可以继续回去监听端口
+                        let mut stream = stream;
+                        let local_as = peer.config.local_as;
+                        let router_id = peer.config.router_id;
+                        let remote_ip = peer_ip;
+
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_neighbor_session(&mut stream, local_as, router_id).await {
+                                eprintln!("🔥 [Peer {}] 会话错误: {}", remote_ip, e);
+                            }
+                        });
                     }
                     _ => {
                         println!("⚠️ [BgpServer] 邻居 {} 已经处于连接状态，拒绝重复连接", peer_ip);
@@ -108,6 +123,73 @@ impl BgpServer {
                 // stream 被 drop，连接断开
             }
         }
+    }
+}
+
+/// 处理单个邻居的会话逻辑 (Phase 3.1: 只做 OPEN 交换)
+async fn handle_neighbor_session(
+    stream: &mut tokio::net::TcpStream, 
+    local_as: u32, 
+    router_id: std::net::Ipv4Addr
+) -> std::io::Result<()> {
+    // ---------------------------------------------------------
+    // 1. 发送我们的 OPEN 消息 (Send OPEN)
+    // ---------------------------------------------------------
+    println!("📤 [Out] 发送 OPEN 消息...");
+    
+    // 构造 Body
+    let open_msg = OpenMessage::new(local_as as u16, 180, router_id);
+    let mut body_buf = BytesMut::new();
+    open_msg.encode(&mut body_buf);
+
+    // 构造 Header
+    let header = BgpHeader {
+        length: (BgpHeader::LENGTH + body_buf.len()) as u16,
+        msg_type: BgpMessageType::Open,
+    };
+    
+    // 最终组装
+    let mut final_buf = BytesMut::new();
+    header.encode(&mut final_buf); // 写头
+    final_buf.extend_from_slice(&body_buf); // 写体
+
+    // 写入 TCP Socket
+    stream.write_all(&final_buf).await?;
+
+    // ---------------------------------------------------------
+    // 2. 读取对方的 OPEN 消息 (Receive OPEN)
+    // ---------------------------------------------------------
+    println!("📥 [In] 等待对方 OPEN 消息...");
+
+    // A. 先读 19 字节 Header
+    let mut header_buf = [0u8; 19];
+    stream.read_exact(&mut header_buf).await?;
+    
+    let mut cursor = Cursor::new(&header_buf[..]);
+    let header = BgpHeader::decode(&mut cursor)?;
+    
+    println!("   -> 收到 Header: Len={}, Type={:?}", header.length, header.msg_type);
+
+    if header.msg_type != BgpMessageType::Open {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Expected OPEN message"));
+    }
+
+    // B. 根据 Header 长度，读取 Body
+    let body_len = header.length as usize - 19;
+    let mut body_buf = vec![0u8; body_len];
+    stream.read_exact(&mut body_buf).await?;
+
+    let mut body_cursor = Cursor::new(&body_buf[..]);
+    let received_open = OpenMessage::decode(&mut body_cursor)?;
+
+    println!("✅ [Handshake] 握手成功！对方信息:");
+    println!("   - Remote AS: {}", received_open.my_as);
+    println!("   - Router ID: {}", received_open.bgp_id);
+    println!("   - Hold Time: {}", received_open.hold_time);
+
+    // 暂时在这里挂起，保持连接不亦断
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     }
 }
 
