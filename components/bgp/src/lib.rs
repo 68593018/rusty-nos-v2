@@ -5,8 +5,14 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt}; // <--- 必须加这个！
 use std::io::Cursor;
-use bytes::BytesMut;
-use crate::packet::{BgpHeader, BgpMessageType, OpenMessage};
+use bytes::{BytesMut, BufMut}; // <--- 关键！必须加上 BufMut
+
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc; // 用于线程间通信
+use tokio::select;     // 用于同时等待 IO 和 定时器
+
+// 头部引入 UpdateMessage
+use crate::packet::{BgpHeader, BgpMessageType, OpenMessage, UpdateMessage};
 
 use ipnet::IpNet;
 
@@ -101,13 +107,13 @@ impl BgpServer {
                         // === 关键修改：启动握手任务 ===
                         // 我们把 stream 的所有权拿走，交给一个新的异步任务去跑
                         // 这样主线程可以继续回去监听端口
-                        let mut stream = stream;
+                        //let mut stream = stream;
                         let local_as = peer.config.local_as;
                         let router_id = peer.config.router_id;
                         let remote_ip = peer_ip;
 
                         tokio::spawn(async move {
-                            if let Err(e) = handle_neighbor_session(&mut stream, local_as, router_id).await {
+                            if let Err(e) = handle_neighbor_session(stream, local_as, router_id).await {
                                 eprintln!("🔥 [Peer {}] 会话错误: {}", remote_ip, e);
                             }
                         });
@@ -126,71 +132,165 @@ impl BgpServer {
     }
 }
 
-/// 处理单个邻居的会话逻辑 (Phase 3.1: 只做 OPEN 交换)
+/// 处理单个邻居的会话逻辑
+/// 包含：握手 -> 拆分读写 -> 主循环 (Select Loop)
 async fn handle_neighbor_session(
-    stream: &mut tokio::net::TcpStream, 
+    mut stream: tokio::net::TcpStream, 
     local_as: u32, 
     router_id: std::net::Ipv4Addr
 ) -> std::io::Result<()> {
-    // ---------------------------------------------------------
-    // 1. 发送我们的 OPEN 消息 (Send OPEN)
-    // ---------------------------------------------------------
-    println!("📤 [Out] 发送 OPEN 消息...");
     
-    // 构造 Body
+    // =================================================================
+    // Phase 3: 握手阶段 (Handshake) - 依然保持线性，确保建立后再进入循环
+    // =================================================================
+    
+    // 1. 发送 OPEN
+    println!("📤 [Out] 发送 OPEN 消息...");
     let open_msg = OpenMessage::new(local_as as u16, 180, router_id);
     let mut body_buf = BytesMut::new();
     open_msg.encode(&mut body_buf);
-
-    // 构造 Header
+    
     let header = BgpHeader {
         length: (BgpHeader::LENGTH + body_buf.len()) as u16,
         msg_type: BgpMessageType::Open,
     };
-    
-    // 最终组装
     let mut final_buf = BytesMut::new();
-    header.encode(&mut final_buf); // 写头
-    final_buf.extend_from_slice(&body_buf); // 写体
-
-    // 写入 TCP Socket
+    header.encode(&mut final_buf);
+    final_buf.extend_from_slice(&body_buf);
     stream.write_all(&final_buf).await?;
 
-    // ---------------------------------------------------------
-    // 2. 读取对方的 OPEN 消息 (Receive OPEN)
-    // ---------------------------------------------------------
+    // 2. 接收 OPEN
     println!("📥 [In] 等待对方 OPEN 消息...");
-
-    // A. 先读 19 字节 Header
     let mut header_buf = [0u8; 19];
     stream.read_exact(&mut header_buf).await?;
-    
     let mut cursor = Cursor::new(&header_buf[..]);
     let header = BgpHeader::decode(&mut cursor)?;
     
-    println!("   -> 收到 Header: Len={}, Type={:?}", header.length, header.msg_type);
-
     if header.msg_type != BgpMessageType::Open {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Expected OPEN message"));
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Expected OPEN"));
     }
 
-    // B. 根据 Header 长度，读取 Body
     let body_len = header.length as usize - 19;
     let mut body_buf = vec![0u8; body_len];
     stream.read_exact(&mut body_buf).await?;
-
     let mut body_cursor = Cursor::new(&body_buf[..]);
     let received_open = OpenMessage::decode(&mut body_cursor)?;
 
-    println!("✅ [Handshake] 握手成功！对方信息:");
-    println!("   - Remote AS: {}", received_open.my_as);
-    println!("   - Router ID: {}", received_open.bgp_id);
-    println!("   - Hold Time: {}", received_open.hold_time);
+    println!("✅ [Handshake] 握手成功! Peer AS: {}", received_open.my_as);
 
-    // 暂时在这里挂起，保持连接不亦断
+    // =================================================================
+    // Phase 4: 拆分读写流 (Split Stream)
+    // =================================================================
+    
+    // 这里我们将 TcpStream 所有权拿走，拆分为“读半部”和“写半部”
+    // 注意：这里的 stream 变成了 owned_read 和 owned_write
+    //let stream = std::mem::replace(stream, tokio::net::TcpStream::connect("0.0.0.0:0").await?); // Hack to take ownership
+    let (mut reader, mut writer) = stream.into_split();
+
+    // 创建一个通道 (Channel): 主逻辑 -> 发送任务
+    // 容量 32 代表可以缓存 32 个待发送的包
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+
+    // --- 启动后台发送任务 (Writer Task) ---
+    // 它只做一件事：从通道收数据，写入 socket
+    tokio::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if let Err(e) = writer.write_all(&packet).await {
+                eprintln!("🔥 [Writer] 发送失败，连接可能已断开: {}", e);
+                break;
+            }
+        }
+        println!("👋 [Writer] 发送任务结束");
+    });
+
+    // =================================================================
+    // Phase 4: 主事件循环 (Main Event Loop)
+    // =================================================================
+    println!("🔄 [Session] 进入全双工主循环...");
+    
+    // 定义定时器：Keepalive (例如每 10 秒发一次)
+    let mut keepalive_timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        // 使用 tokio::select! 宏，这就像 C语言的 select/epoll
+        // 谁先准备好，就处理谁
+        tokio::select! {
+            // 事件 A: 收到网络数据 (Reader)
+            result = read_packet(&mut reader) => {
+                match result {
+                    Ok(Some(msg_type)) => {
+                         // 收到包的处理逻辑 (例如收到 Update)
+                         // 可以在这里调用 handle_update(...)
+                    }
+                    Ok(None) => {
+                        println!("⚠️ [Session] 对方关闭了连接");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ [Session] 读取错误: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            // 事件 B: 定时器到期 (Timer)
+            _ = keepalive_timer.tick() => {
+                // 发送 Keepalive
+                // 构造一个 Keepalive 包 (19字节头，无Body)
+                // println!("💓 [Timer] 发送 Keepalive...");
+                let mut buf = BytesMut::new();
+                // 偷懒构造：16个FF + Length(19) + Type(4)
+                for _ in 0..16 { buf.put_u8(0xFF); }
+                buf.put_u16(19);
+                buf.put_u8(4); // Type 4 = Keepalive
+                
+                // 通过通道发给 Writer 任务
+                if tx.send(buf.to_vec()).await.is_err() {
+                    break; // 通道断了说明 Writer 死了
+                }
+            }
+            
+            // 未来事件 C: 收到 RIB 的路由变动通知
+            // _ = rib_rx.recv() => { ... Send Update ... }
+        }
     }
+
+    Ok(())
+}
+
+/// 辅助函数：从 Reader 读取一个完整的 BGP 包
+/// 返回：Ok(Some(MsgType)) 表示成功读到一个包
+async fn read_packet(reader: &mut OwnedReadHalf) -> std::io::Result<Option<BgpMessageType>> {
+    // 1. 读 Header
+    let mut header_buf = [0u8; 19];
+    // read_exact 返回 0 表示 EOF
+    match reader.read_exact(&mut header_buf).await {
+        Ok(_) => {},
+        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let mut cursor = Cursor::new(&header_buf[..]);
+    let header = BgpHeader::decode(&mut cursor)?;
+
+    // 2. 读 Body
+    let body_len = header.length as usize - 19;
+    if body_len > 0 {
+        let mut body_buf = vec![0u8; body_len];
+        reader.read_exact(&mut body_buf).await?;
+        
+        let mut body_cursor = Cursor::new(&body_buf[..]);
+        
+        if header.msg_type == BgpMessageType::Update {
+            // 这里解析 Update
+            let update = UpdateMessage::decode(&mut body_cursor)?;
+            println!("📦 [RX] UPDATE: 撤销 {:?}, 新增 {:?}", update.withdrawn_routes.len(), update.nlri.len());
+        }
+    } else if header.msg_type == BgpMessageType::Keepalive {
+        println!("💓 [RX] Keepalive");
+    }
+
+    Ok(Some(header.msg_type))
 }
 
 // =========================================================
